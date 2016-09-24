@@ -1,0 +1,243 @@
+from: http://www.contrib.andrew.cmu.edu/~somlo/OSXKVM/#sec_3_2_1
+
+Running Mac OS X as a QEMU/KVM Guest
+
+Gabriel L. Somlo
+
+Last updated: Mon. Sep. 05, 2016
+Feedback to: somlo at cmu dot edu
+0. I Just Want It Working, Right Now !
+
+OK, here's what you'll need (or skip to the technical details instead):
+Development Tools: git, gcc[-c++], [auto]make, iasl, kernel-devel, etc. On Fedora,
+	yum install @development-tools acpica-tools kernel-devel
+should take care of it. But, if following the rest of the directions below, you get weird build failures and other unexplained errors, consider the possibility that you're missing something in this category, possibly something I didn't think of listing explicitly above...
+KVM: As of kernel version 3.15, all necessary functionality is already integrated upstream. Right now, I have 3.15.3-200.fc20.x86_64 on my Fedora 20 machine, and everything works out of the box.
+For older kernels, it may be possible to build KVM kernel modules using the kvm-kmod "wrapper", by following these instructions. Then, as root, while still in the kvm-kmod directory (substitute kvm_amd for kvm_intel, depending on your CPU):
+	modprobe -r kvm_intel
+	cp ./x86/kvm*.ko /lib/modules/<your-kernel>/kernel/arch/x86/kvm/
+	modprobe kvm_intel
+QEMU: Download QEMU 2.1.0 or later. This contains and installs an appropriately patched SeaBIOS binary as well, so there's no longer a need to download, build, and install a separate instance of SeaBIOS. Configure and build QEMU using something like:
+	cd qemu-2.1.0
+	./configure --prefix=/home/$(whoami)/OSXGUEST --target-list=x86_64-softmmu
+	make clean; make; make install
+Chameleon: an additional bootloader is currently needed to bridge the gap between SeaBIOS and the Apple EFI BIOS expected by Mac OS X. Source is available from the project's SVN repo, but since it requires Mac OS X and Xcode to build, I've uploaded a binary image which you may use until you're ready to build your own.
+Once the above components are in place, you'll need a HDD image for your Mac OS X guest:
+	cd /home/$(whoami)/OSXGUEST
+	qemu-img create -f qcow2 mac_hdd.img 30G
+As of Yosemite (OS X 10.10), on kernels older than 4.7, we need to tell KVM to ignore unhandled MSR accesses (During boot, Yosemite attempts to read from MSR 0x199, which is related to CPU frequency scaling, and is clearly not applicable to a VM guest):
+        echo 1 > /sys/module/kvm/parameters/ignore_msrs
+To start your Mac OS X guest in QEMU, use the following command line:
+	bin/qemu-system-x86_64 -enable-kvm -m 2048 \
+          -cpu core2duo,vendor=GenuineIntel \
+	  -machine q35 \
+	  -usb -device usb-kbd -device usb-mouse \
+	  -device isa-applesmc,osk="insert-real-64-char-OSK-string-here" \
+	  -kernel ./chameleon_svn2783_boot \
+	  -smbios type=2 \
+	  -device ide-drive,bus=ide.2,drive=MacHDD \
+	  -drive id=MacHDD,if=none,file=./mac_hdd.img \
+	  -netdev user,id=hub0port0 \
+	  -device e1000-82545em,netdev=hub0port0,id=mac_vnet0 \
+	  -monitor stdio
+Optionally, to start an SMP guest, one could use something like:
+	  -smp 4,cores=2
+When running the OS X guest for the first time, you'll need to install the operating system to the HDD image, so you'll need to add (and boot from) an install DVD image on the command line.
+	  -device ide-drive,bus=ide.0,drive=MacDVD \
+	  -drive id=MacDVD,if=none,snapshot=on,file=./Yosemite.10.10.2.iso
+SnowLeopard (10.6) was the last OS X version released in DVD format. Starting with Lion (10.7), an install DVD (.iso) image may be generated on an OS X machine by following the steps below (Thanks Dick Marinus for pointing out the Yosemite-specific updates!):
+	# As of Yosemite, this really only works if executed as root,
+	# so let's start with that:
+	sudo -s
+
+	# Mount the installer image:
+	hdiutil attach /Applications/Install\ OS\ X\ Yosemite.app/Contents/SharedSupport/InstallESD.dmg -noverify -nobrowse -mountpoint /Volumes/install_app
+
+	# Convert the boot image to a sparse bundle:
+	hdiutil convert /Volumes/install_app/BaseSystem.dmg -format UDSP -o /tmp/Yosemite
+
+	# Increase the sparse bundle capacity for packages, kernel, etc.:
+	hdiutil resize -size 8g /tmp/Yosemite.sparseimage
+
+	# Mount the sparse bundle target for further processing:
+	hdiutil attach /tmp/Yosemite.sparseimage -noverify -nobrowse -mountpoint /Volumes/install_build
+
+	# Remove Package link and replace with actual files:
+	rm /Volumes/install_build/System/Installation/Packages
+	cp -rp /Volumes/install_app/Packages /Volumes/install_build/System/Installation/
+
+	# NEW: As of Yosemite, there are additional installer dependencies:
+	cp -rp /Volumes/install_app/BaseSystem* /Volumes/install_build/
+
+	# NEW: As of Yosemite, we also need a kernel image!
+	# Assuming we're executing these steps on a Yosemite machine with
+	# a version EXACTLY matching that of the installer we're preparing:
+	cp -rp /System/Library/Kernels /Volumes/install_build/System/Library/
+	# NOTE: If the running OS X version is not identical to that of
+	#       the installer being prepared, one may copy the
+	#       necessary files (/System/Library/Kernels/*) from the
+	#       /Volumes/install_app/Packages/Essentials.pkg package,
+	#       using third party software (e.g. Pacifist -- WARNING:
+	#       shareware, not free/open source software, your ideological
+	#       purity may vary).
+
+	# Unmount both the installer image and the target sparse bundle:
+	hdiutil detach /Volumes/install_app
+	hdiutil detach /Volumes/install_build
+
+	# Resize the partition in the sparse bundle to remove any free space:
+	hdiutil resize -size $(hdiutil resize -limits /tmp/Yosemite.sparseimage | tail -n 1 | awk '{ print $1 }')b /tmp/Yosemite.sparseimage
+
+	# Convert the sparse bundle to ISO/CD master:
+	hdiutil convert /tmp/Yosemite.sparseimage -format UDTO -o /tmp/Yosemite
+
+	# Remove the sparse bundle:
+	rm /tmp/Yosemite.sparseimage
+
+	# Rename the ISO and move it to the desktop:
+	mv /tmp/Yosemite.cdr ~/Desktop/Yosemite.iso
+There are still a few remaining issues to be worked out:
+You will need to supply the correct 64-character string as the argument of the osk="..." command line parameter above. This string is the concatenated result of two 32-bit keys, OSK0 and OSK1, which can be read from the AppleSMC chip shipping on genuine Apple machines. I wrote a small userspace program based on the Linux kernel applesmc driver, SmcDumpKey.c, which can be used (on a Mac running Linux) to query the SMC for various key values. For the full details, please see here.
+SnowLeopard (10.6), Lion (10.7), MountainLion (10.8) and Mavericks (10.9) can all be booted, with the following caveats:
+10.6 and 10.7 require the "idlehalt=0" kernel argument to be passed in (e.g., at the Chameleon "boot:" prompt) to avoid using the unsupported MONITOR and MWAIT CPU instructions.
+10.6 and early versions of 10.7 (somewhere prior to 10.7.5) will crash with a "HPET not found" panic on a PIIX + SMP guest. This can be fixed with this patch, but since the problem only occurs on relatively early versions of OS X on the "secondary" platform (PIIX, as opposed to the "primary" Q35), I've decided to hold off on trying to upstream it for now.
+Early 10.8 (definitely 10.8.0) will hang during boot for unknown reasons. Using 10.8.5 boot media (DVD iso or installed HDD image) works fine.
+10.9 "firstboot" (i.e., booting from a freshly installed HDD image for the first time) only works with SMP, for currently unknown reasons. Once the initial setup is complete, the HDD image can be booted on either SMP or uniprocessor guests.
+The main goal of this work is to get Mac OS X working with upstream KVM/QEMU/etc., so I'm mainly targeting these projects' git master branches. The patches I refer to may work against recently released versions, but please consider that as nothing more than a happy coincidence :)
+Legal Disclaimer: I am not a lawyer, and this is not legal advice. Taking into account that OS X is now officially supported on commercial virtualization solutions such as VMWare Fusion and Parallels, and after a careful reading of Apple's OS X EULA (which states that "[...] you are granted a [...] license to install, use and run one (1) copy of the Apple Software on a single Apple-Branded computer at any one time"), it is my belief that it's OK to run Mac OS X as a QEMU guest, provided the host hardware is a genuine, Apple-manufactured Mac computer, running an arbitrary (e.g. Linux) host OS. This happens to be how I'm using it, but YMMV.
+Please read on for a detailed overview of all the issues involved !
+1. Intro, Motivation, and Overview
+
+This work started out as my OS Practicum project during the Fall of 2012, where I picked Mac OS X on QEMU/KVM as my topic. I'm a "native" Linux user, but my IT department supports quite a few Mac OS X users, and I decided I could be much faster and more productive if I could access a Mac as a VM guest rather than dual-boot or cold-start an additional machine each time it was needed.
+The original work to enable OS X to run under QEMU/KVM was done by Alexander Graf. Additional kernel and userspace patches were contributed by René Rebe. Previously available patches and documentation I reviewed include:
+René's patches at T2
+git://gitorious.org/~drizztbsd/kvm/qemu-kvm-osx.git
+http://github.com/saucelabs/mac-osx-on-kvm.git
+The by now really out of date Wiki instructions at
+http://d4wiki.goddamm.it/index.php?title=Howto:_Mac_OSX_on_KVM
+Several different components must successfully interact with each other to facilitate running Mac OS X as a QEMU/KVM guest. Each component is listed below, with a link to its dedicated section covering relevant aspects and outstanding issues related to Mac OS X guest support:
+KVM Kernel Module: at the lowest level, this component provides an in-kernel hardware assisted virtualization infrastructure.
+QEMU: userspace emulator which takes advantage of the hardware virtualization facilities provided by KVM to run a guest at nearly native hardware performance.
+SeaBIOS: default BIOS used with QEMU.
+Chameleon: a bootloader used to bridge the gap between SeaBIOS and the EFI-compatible BIOS shipping with Apple hardware.
+2. KVM Kernel Module
+
+KVM is the component located at the lowest level, providing an interface to the virtualization support offered by (among a few others) the x86_64 hardware architecture. Let's begin with a brief list of upstream resources:
+Project home page: http://www.linux-kvm.org/
+Master git repo: git://git.kernel.org/pub/scm/virt/kvm/kvm.git
+This is actually a full clone of the mainline kernel git repo, with KVM-specific commits added on top. Therefore, it is slightly less convenient to work with, although any attempts at commiting changes upstream must apply cleanly (and work correctly) against it.
+Kmod "wrapper": git://git.kiszka.org/kvm-kmod.git
+This allows building KVM kernel modules against (and loadable into) a distro kernel (such as what ships on e.g., F18), as shown here.
+Earlier OS X versions (up to 10.7 a.k.a. Lion) indiscriminately use MONITOR and MWAIT instructions, which are not currently supported by KVM and which result in an "invalid opcode" fault when a guest attempts to execute them. A thorough explanation is given here. Beginning with 10.8 (MountainLion), the OS X kernel follows the recommended practice of checking CPUID for MONITOR/MWAIT support, and will not attempt to use them if not supported. To run 10.7 or earlier versions of OS X, either apply this additional KVM patch, or, on an already installed HDD image, run:
+	rm -rf System/Library/Extensions/AppleIntelCPUPowerManagement.kext
+to prevent OS X from attempting to use the unsupported instructions.
+The last KVM patch required to boot OS X (already applied upstream) is a misleadingly simple-looking one liner, which removes a single line from virt/kvm/ioapic.c (or x86/ioapic.c in the kvm-kmod version):
+-	irq_level ^= entry.fields.polarity;
+Without removing this line, a Mac OS X guest hangs during boot with an error message that reads: "still waiting for root device".
+Modern x86 system design includes Intel's IOAPIC (interrupt controller) chip, which receives interrupts from peripheral devices and forwards them to the appropriate CPU's local interrupt controller (LAPIC). The IOAPIC can be programmed to handle both level and edge triggered interrupts. Historically, with the IOAPIC's predecessor (the 8259 PIC), level triggered interrupts were considered "active" (or "asserted") when the line went "high", and "inactive" when the line remained "low", from an electrical standpoint. In other words, the "logical" state of an interrupt line coincided with its "physical" state. With the IOAPIC, it is possible to configure each individual input (interrupt line) to use the "classic" interpretation of "active" vs. "inactive", now referred to as "ActiveHigh", or to reverse it by setting a per-input-line "polarity bit", so that interrupts are considered asserted when the line drops to "low" from a default inactive "high" voltage state. This mode is known as "ActiveLow". With "ActiveLow", the physical state of the line is the exact opposite of its logical state.
+ACPI-compliant operating systems are expected to query the firmware for an indication of which polarity type (ActiveLow or ActiveHigh) to use for any devices with level-triggered interrupts, and to configure the IOAPIC registers accordingly. Both QEMU and KVM have accumulated a significant number of optimizations based on the assumption that guest operating systems use ActiveHigh polarity, and are coded to assume that "physical" and "logical" IRQ line states are in sync. Even when a misbehaving guest OS (you guessed it, OS X does this) ignores the ACPI polarity hint (which in QEMU/KVM is ActiveLow, i.e. "physical"=="logical") and configures the virtual IOAPIC with the wrong polarity bit values, both QEMU and KVM will mostly use "logical" IRQ line levels.
+The referenced patch removes the last place where KVM attempted to care about the value of the polarity bit placed into the IOAPIC register by the guest OS. Because logical levels were assumed everywhere else, looking at the polarity bit could result in flipping the given "logical" line state at the wrong time, resulting in level triggered interrupts being ignored instead of handled. Once we stop paying attention to the polarity bit values, things work fine. Logical IRQ levels are passed into KVM from userspace by QEMU, and whatever the guest OS does when it programs its IOAPIC polarity bits doesn't matter. Thus, when OS X wrongfully ignores QEMU's ACPI and proceeds with a hard-coded ActiveLow polarity, things just work in spite of that.
+3. QEMU
+
+QEMU is a multi-architecture emulator running in user-space. For certain architectures (such as x86_64), QEMU is able to take advantage of hardware virtualization features offered through e.g. KVM, which allow it to run guests at near-native performance levels. Here is roughly how QEMU and KVM work together to implement a guest VM:
+QEMU starts as a user-mode process, launching one thread for each VCPU that will be part of the guest VM. The guest system's "physical" memory is allocated as part of the virtual address space of the QEMU process, and various handlers for the emulated virtual hardware of the guest systems are prepared.
+Each QEMU VCPU thread makes an ioctl() call into the kernel (where it will be serviced by KVM), requesting that the VCPU be scheduled on a pyhsical core. This ioctl() call will only return to userspace if/when KVM encounters a VM exit it can't handle itself. This typically involves a need for userspace emulation of specific guest hardware. Normally, when the userspace emulation is complete, the QEMU VCPU thread loops back to the spot where it calls into the kernel via the ioctl().
+KVM handles the kernel-side of the ioctl() call made by each QEMU VCPU thread. Normally, it causes the physical core on which the thread is scheduled to enter VM guest mode (a.k.a. L>1). Whenever a VM exit (back to host mode) occurs, KVM attempts to handle the exit cause itself, and immediately re-enters VM guest mode if successful. Otherwise, the VM exit reason is passed back to userspace by falling out of the ioctl() call, at which point QEMU must handle it as described above, before calling back into KVM again via the ioctl().
+A quick list of QEMU upstream resources might include:
+Project home page: http://qemu.org/
+Master git repo: git://git.qemu.org/qemu.git
+There are four relevant topics regarding support for Mac OS X guests: QEMU's recent inclusion of support for the Q35/ICH9 based architecture; emulation of Apple's System Management Controller (a.k.a. AppleSMC), including automatically advertising its presence via ACPI; and, finally, a few issues related to QEMU's emulation of the e1000 network controller.
+3.1. The Q35/ICH9 architecture
+
+Support for the Q35 architecture was recently (Dec. 2012) merged into QEMU mainline. Q35 replaces the old I440FX (a.k.a. PIIX) with Intel's more modern ICH9 chipset, which also happens to be used on most Intel-based Apple hardware. Among other hardware, ICH9 includes an integrated AHCI disk controller, which had to be added explicitly prior to the Q35 QEMU command line:
+	bin/qemu-system-x86_64 -enable-kvm -m 2048 -cpu core2duo \
+	  -device ahci,id=ide \
+	  -usb -device usb-kbd -device usb-mouse \
+	  -device isa-applesmc,osk="insert-real-64-byte-OSK-string-here" \
+	  -kernel ./chameleon_svn2783_boot \
+	  -smbios type=2 \
+	  -device ide-drive,bus=ide.2,drive=MacHDD \
+	  -drive id=MacHDD,if=none,file=./mac_10.8.img \
+	  -netdev user,id=usr0 \
+	  -device e1000-82545em,netdev=usr0,id=vnet0,bus=pci.0,addr=5 \
+	  -monitor stdio
+As Q35 is slated to become the new default "machine type" in QEMU in the near future, the bulk of the effort (development, debugging, and testing) to get Mac OS X supported under QEMU will be focused on this platform.
+3.1.1. Ethernet Link negotiation issues with e1000 on PIIX
+
+Starting with MountainLion (OS X 10.8), the proprietary e1000 network driver built into OSX (AppleIntel8254XEthernet.kext) fails to detect network link unless special care is taken to move the network card to a separate hardware IRQ line from the AHCI/SATA controller. By default with the above command line (i.e. without using ",bus=pci.0,addr=5"), the network card will be placed in PCI slot 4, and will share IRQ11 with a bunch of other devices (e.g. AHCI/SATA, USB, etc). Moving it to PCI slot 5 causes it to use IRQ10 by itself, which is a sufficient workaround for the problem, at least for now.
+After some reverse engineering, it appears that the AppleIntel8254XEthernet.kext reads the e1000 ICR (Interrupt Cause Register) each time a PCI interrupt is detected. However, until e1000 initialization is complete, including the final configuration of the e1000 IMR (Interrupt Mask Register), any e1000 interrupts, including LSC (link state change) are ignored. The driver "knows" it hasn't unmasked the interrupt yet, so while it reads the self-clearing ICR on hardware interrupt, it simply ignores the contents, which is then lost due to the register's reset-on-read behavior.
+Normally, the driver has enough time to finish setting up the mask register before a PCI interrupt is generated by the hardware when link autonegotiation is completed. However, by sharing a hardware IRQ line with the "noisy" SATA controller, the hardware interrupt handler portion of the e1000 driver (which reads the ICR) is invoked early and often, before the mask setup is completed, leading to the asserted link state change interrupt being discarded before it can be acted upon.
+Moving the e1000 card to a new hardware IRQ line away from SATA (by forcing it into a custom PCI "slot") solves the problem by not invoking the e1000 hardware interrupt handler before setup is complete. Another workaround (suggested by Alex Graf) is to delay reporting the LSC interrupt to the guest until the IMR (mask register) was configured. However, as pointed later in that thread, this patch may be problematic for guests wishing to poll the ICR without relying on hardware interrupts (by setting up a mask). Although mostly a theoretical issue at this point, this patch would significantly differ from expected hardware behavior.
+3.2. The AppleSMC emulator
+
+The AppleSMC (or System Management Controller) is a chip specific to Intel-based computers manufactured by Apple. Its main purpose is to control (and report on) fan speeds, temperature sensors, screen and keyboard light intensity levels, and miscellaneous other power management features.
+From the point of view of the operating system driver, interaction with the SMC happens via port-based I/O: The name of a 4-character key is written to a control port, and the key's numeric or ASCII value is then read from (or written to) a data port. Keys typically represent fan speeds, light intensity levels, or temperatures.
+A pair of already upstreamed patches advertises the presence of the SMC in QEMU's ACPI/DSDT table, conditionally, based on whether or not it was specified on the QEMU command line.
+There are currently two outstanding issues with QEMU's AppleSMC emulation which could improve Mac OS X guest support, outlined below.
+3.2.1. Automatic OSK "pass-through" on Apple hardware
+
+The AppleSMC is also used to store a 64-byte ASCII string copyrighted by Apple, spread across two 32-byte key values, named OSK0 and OSK1. This string is used by Mac OS X to determine whether it's being booted on genuine Apple hardware. QEMU does not set up AppleSMC emulation by default (since only OS X guests require it at this time). To set it up, the following QEMU command line snippet is required:
+	-device isa-applesmc,osk="insert-real-64-byte-OSK-string-here"
+The user must supply the correct value of the 64-byte OSK string as an argument, and is responsible for honoring Apple's OS X EULA (which states that "[...] you are granted a [...] license to instal, use and run one (1) copy of the Apple Software on a single Apple-Branded computer at any one time").
+I wrote a small C program, SmcDumpKey.c, which can be used to read various SMC key values (including OSK0 and OSK1) from an Intel Mac running Linux. However, a significant improvement in usability and ease of compliance with the OS X EULA could be accomplished by allowing QEMU's AppleSMC emulator to automatically acquire the OSK strings from the underlying (Apple) host hardware.
+Currently, the drivers/hwmon/applesmc.c Linux driver populates a Sysfs directory (/sys/devices/platform/applesmc.768/) which offers access to most SMC key values. Unfortunately, that does not include OSK0 and OSK1. I submitted this patch against the applesmc.c Linux driver, but encountered two main objections (also see the various other replies in the referenced thread):
+/sys/devices/platform/applesmc.768/ is (or should be) reserved for hardware-monitoring related keys and values only; This point seems to be contradicted by Documentation/sysfs-rules.txt in the Linux kernel sources, which states that each device should get its own node (directory) in a device tree, and does not recommend spreading any device's entries into separate spots across Sysfs by any sort of "category".
+The OSK values are constant, so it makes no sense to query the hardware if we know ahead of time what the returned value will be. My counter argument to that is that it makes perfect sense to query the hardware each time, precisely because Apple claims copyright on the returned string, which can therefore never be legally hardcoded (and distributed) in any open source project such as QEMU.
+I'm planning to follow up with the Linux maintainer of applesmc.c again in the near future to reiterate these points, but in the mean time I could really use some advice and feedback from anyone with successful patch submission experience to the Linux kernel :)
+3.2.2. OS X fails to write a key value to the emulated SMC
+
+During boot, Mac OS X will log a few non-fatal SMC-related errors:
+	SMC::smcGetVersWithSMC ERROR: smcReadKey REV failed (0xff)
+	SMC::smcInitHelper ERROR: smcPublishVersion failed (0xff)
+	SMC::smcInitHelper ERROR: smcPublishShutdownCause failed (0xff)
+	SMC::smcPublisVersion ERROR: smcGetVers for SMC 0 failed (0xff)
+	SMC::smcNotificationPublishedHandler ERROR: smcWriteKey NTOK failed (0xff), will not receive interrupts
+It appears that emulating a few extra SMC keys, as well as allowing the OS X guest to write (as opposed to just read) some of the supported keys might make these errors go away.
+3.3. The virtio-net virtual network card
+
+A great alternative to using the default e1000 virtual network card (albeit one that requires post-install "surgery" on the guest) appears to be using virtio-net instead (thanks George Yunaev and Warren Togami for pointing this out!). Start the guest with the following additional command line arguments:
+	-netdev user,id=hub0port0 \
+	-device virtio-net,netdev=hub0port0,id=eth0
+and install the "aftermarket" virtio-net driver by Phil Jordan on the guest side. Since our guest does not have a network connection, download the driver on the host like so:
+	mkdir VirtIoNetDrv
+	(cd VirtIoNetDrv; wget http://github.com/pmj/virtio-net-osx/raw/master/bin/Virtio-Net-Driver-0.9.4.pkg)
+and then start your guest with an additional FAT "drive" mapped to the "./VirtIoNetDrv/" download directory:
+	-device ide-drive,bus=ide.4,drive=fatdrive \
+	-drive id=fatdrive,file=fat:ro:VirtIoNetDrv
+Once the guest is up, install the driver via the usual method, and restart. A new Ethernet interface should become available, and should work from that point on with minimum fuss. Tested and confirmed working on OS X 10.8.5 and 10.9.*.
+3.4. Boot OS X on QEMU without KVM hardware assistance
+
+This now works (albeit very slowly, too slowly to be useful in practice), with the following (already upstreamed) patches:
+OS X requires a software-emulated LAPIC version of 0x14 or higher;
+The software-emulated IOAPIC must ignore polarity bits set by the guest, matching the hardware-accelerated behavior of the KVM IOAPIC.
+4. SeaBIOS
+
+SeaBIOS is the default BIOS for QEMU/KVM. The QEMU source tree includes a sufficiently up-to-date snapshot of SeaBIOS (in pre-built, binary form). For reference only at this point, upstream resources include:
+Project home page: http://www.seabios.org/
+Master git repo: git://git.seabios.org/seabios.git
+SeaBIOS has been patched to accept SMBIOS tables generated by QEMU. At this point, all SMBIOS tables will be v2.8 compliant (a version newer than 2.4 is required to support "About This Mac" without crashing Finder), and the user may specify the inclusion of a Type 2 (Baseboard) entry, required for booting [Mountain]Lion, on the qemu command line:
+	-smbios type=2
+5. Chameleon
+
+Chameleon is a Darwin/XNU boot loader based on Apple's boot-132. It is currently used to boot OS X on systems which do not contain Apple's EFI BIOS as expected. Project resources include:
+Project home page: http://chameleon.osx86.hu/
+SVN repository: http://forge.voodooprojects.org/svn/chameleon
+Chameleon boots the OS X kernel (XNU) in three stages. We are interested mainly in the last stage (known as "stage 2", counting from 0). The project is designed to be built under OS X itself, and also depends on Xcode. Xcode v5.0.2 (free/beer download via the AppStore) on OS X 10.8 or later can build the latest Chameleon trunk (SVN 2360 at the time of this writing). Once these prerequisites are met, simply running 'make' in the appropriate SVN subdirectory will build the entire project.
+The Chameleon stage-2 bootloader will be built as "./sym/i386/boot". On QEMU, we bypass all earlier stages by loading this binary as the default "kernel" (via the "-kernel chameleon_svn2783_boot" command line argument). On a (U)EFI compliant machine, in theory, (U)EFI would find a file named "/System/Library/CoreServices/boot.efi" on the OS X partition and use it directly. Chameleon's stage-2 "boot" file is a roughly equivalent replacement for that.
+Chameleon offers a range of additional "bells and whistles", such as the ability to load alternative and/or additional .kext modules (OS X kernel drivers), and replace the system's default ACPI DSDT, mostly intended for "hackintosh" systems. On QEMU, however, the idea is to offer a DSDT and virtualized "hardware" that's close enough for OS X to run on, without needing that type of "assistance" from the bootloader.
+An example Chameleon configuration (create a new file under /Extra/org.chameleon.boot.plist) is shown below. The example configures Chameleon to automatically enter the first encountered OS X partition after a 5-second wait. It also forces the guest video settings to 1280x1024 pixels, 32-bit color depth (which is something that currently can't be done from *within* the guest's display settings, for reasons I'm still investigating). Thanks to Andrei Ostanin, Christian Simon, and Warren Togami!
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+                           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>  
+        <key>Timeout</key>
+        <string>5</string>
+        <key>Graphics Mode</key>
+        <string>1280x1024x32</string>
+    </dict>  
+In the long term, it might be possible to use a QEMU-compatible UEFI BIOS instead of SeaBIOS, and have it boot into OS X using the original /System/Library/CoreServices/boot.efi Apple-provided bootloader.
+6. Conclusion and Future Work
+
+My ultimate goal is to upstream whatever changes are needed to KVM/QEMU/SeaBIOS/Chameleon/etc., to allow installing and running OS X from unadulterated, standard images. I plan to keep this document updated with the current list of outstanding issues. Eventually, the idea is for this document to "melt away" as all these issues are addressed, and all patches are accepted into their respective upstream projects.
+I appreciate any ideas, comments, and feedback. Please email me at somlo at cmu dot edu with any questions, comments, and suggestions.
